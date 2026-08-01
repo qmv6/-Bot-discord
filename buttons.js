@@ -1,135 +1,241 @@
-const { ActivityType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const fs   = require('fs');
-const path = require('path');
-const cron = require('node-cron');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
 const client = require('../client');
-const config = require('../config');
-const { logError }                                                   = require('../utils/logger');
-const { updateUserRoles, updateJobRoles }                            = require('../utils/roleManager');
-const { getUserIdentities }                                          = require('../db/identity');
-const { cleanupTempFolder, cacheTracker, saveCacheTracker, cacheDir } = require('../utils/cacheManager');
-const { cleanupExpiredThreads, sendReminder, cleanupAbandonedThreads } = require('../handlers/sessions');
-const { cleanupExpiredJobRoles }                                     = require('../crons/jobs');
-const { cleanupExpiredIdentities }                                   = require('../crons/dbCleanup');
-const VerificationSession                                            = require('../models/VerificationSession');
-const GuildConfig                                                    = require('../models/GuildConfig');
+const User   = require('../models/User');
+const { logError }                         = require('../utils/logger');
+const { updateUserRoles, updateJobRoles }  = require('../utils/roleManager');
+const { getCachedImage }                   = require('../utils/cacheManager');
+const robloxAPI                            = require('../services/robloxAPI');
 
-async function sendVerificationEmbed(channel) {
-    const embed = new EmbedBuilder()
-        .setColor('#B6B6B6')
-        .setTitle('🪪 نظام إنشاء وتجديد الهوية')
-        .setDescription('الخطوات:\n1️⃣ اضغط على الزر المناسب\n2️⃣ سيتم إنشاء ثريد خاص معك\n3️⃣ جاوب على الأسئلة داخل الثريد\n⚠️ ملاحظة:\n- الحد الأقصى: 3 هويات\n- المهلة: 30 دقيقة\n- صلاحية الهوية: 14 يوم')
-        .setImage('https://i.postimg.cc/6QLzGPPz/6061040cb980494b.png');
-    const buttons = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('start_verification').setLabel('إنشاء هوية').setStyle(ButtonStyle.Danger).setEmoji('<:2_red:1432346120033538130>'),
-        new ButtonBuilder().setCustomId('start_renewal').setLabel('تجديد هوية').setStyle(ButtonStyle.Primary).setEmoji('🔄')
-    );
-    await channel.send({ embeds: [embed], components: [buttons] });
+function getDB()       { return require('../db/identity'); }
+function getSessions() { return require('./sessions'); }
+
+function generateVerificationCode() {
+    const chars = '0123456789ABCDEF';
+    return Array.from({ length: 8 }, () => chars[Math.floor(Math.random() * chars.length)]).join(' ');
 }
 
-async function checkAndRepostEmbed() {
+async function showIdentity(ctx, target, identity, identityNum = null) {
     try {
-        for (const guild of client.guilds.cache.values()) {
-            const guildConfig = await GuildConfig.findOne({ guildId: guild.id });
-            if (!guildConfig?.verificationChannelId) continue;
+        const userObj = (typeof target === 'string')
+            ? await client.users.fetch(target).catch(() => null)
+            : target;
+        if (!userObj) { if (ctx.reply) await ctx.reply('**❌️ | لا يمكنني العثور على هذا العضو.**').catch(() => null); return; }
 
-            const channel = await client.channels.fetch(guildConfig.verificationChannelId).catch(() => null);
-            if (!channel) continue;
+        const userDoc = await User.findOne({ discordId: userObj.id });
+        if (!userDoc) return;
 
-            const messages   = await channel.messages.fetch({ limit: 10 });
-            const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-            const existing   = messages.find(m =>
-                m.author.id === client.user.id &&
-                m.components.length > 0 &&
-                m.components[0].components.some(b => b.customId === 'start_verification')
-            );
+        let targetIdentity = identity;
+        if (targetIdentity?.id) {
+            const fresh = userDoc.identities.find(id => id.id === targetIdentity.id);
+            if (fresh) targetIdentity = fresh;
+        }
+        if (!targetIdentity) targetIdentity = userDoc.identities[0];
+        if (new Date(targetIdentity.expiryDate) < new Date()) {
+            if (ctx.reply) await ctx.reply('**❌️ | الهوية منتهية الصلاحية، يرجى تجديدها.**').catch(() => null);
+            return;
+        }
+        if (identityNum === null) identityNum = userDoc.identities.findIndex(id => id.id === targetIdentity.id) + 1;
 
-            if (existing) {
-                if (existing.createdTimestamp < oneWeekAgo) {
-                    await existing.delete().catch(() => null);
-                    await sendVerificationEmbed(channel);
-                }
-            } else {
-                await sendVerificationEmbed(channel);
+        const data = {
+            userId: userObj.id, name: targetIdentity.name, gender: targetIdentity.gender,
+            job: targetIdentity.job, age: targetIdentity.age, rank: targetIdentity.position || 'لا يوجد',
+            user: targetIdentity.robloxUsername, idNumber: targetIdentity.idNumber,
+            robloxUserId: targetIdentity.robloxUserId, robloxUsername: targetIdentity.robloxUsername,
+            expiryDate: targetIdentity.expiryDate.toISOString().split('T')[0]
+        };
+
+        const cachedImage = await getCachedImage(userObj.id, identityNum, data);
+        if (!cachedImage) { if (ctx.reply) await ctx.reply('❌ | **حدث خطأ في عرض الهوية.**').catch(() => null); return; }
+
+        const payload = { content: `<@${userObj.id}>`, files: [cachedImage], allowedMentions: { parse: [] } };
+        if (ctx.editReply)  await ctx.editReply(payload);
+        else if (ctx.reply) await ctx.reply(payload);
+        else                await ctx.channel.send(payload);
+    } catch (error) {
+        logError(error, 'showIdentity');
+        if (ctx.reply) await ctx.reply('❌ | **حدث خطأ في عرض الهوية.**').catch(() => null);
+    }
+}
+
+async function handleIdentitySelection(interaction) {
+    try {
+        const [,, authorId, targetId, idId] = interaction.customId.split('_');
+        if (interaction.user.id !== authorId) { await interaction.reply({ content: '❌ | **ليس لك**', flags: 64 }); return; }
+        const userDoc  = await User.findOne({ discordId: targetId });
+        const identity = userDoc?.identities.find(id => id.id == idId);
+        if (identity) {
+            await interaction.update({ components: [] });
+            const identityNum = userDoc.identities.findIndex(id => id.id == idId) + 1;
+            await showIdentity(interaction, targetId, identity, identityNum);
+        }
+    } catch (error) { logError(error, 'handleIdentitySelection'); }
+}
+
+async function handleRenewalIdentitySelection(interaction) {
+    try {
+        const parts      = interaction.customId.split('_');
+        const userId     = parts[3];
+        const identityId = parts[4];
+        if (interaction.user.id !== userId) { await interaction.reply({ content: '❌ | **ليس لك**', flags: 64 }); return; }
+        await interaction.update({ components: [] });
+        const { cleanupSession, createSession, sendQuestionWithRetry } = getSessions();
+        await cleanupSession(userId);
+        const thread = await interaction.channel.threads.create({
+            name: `تجديد-${interaction.user.username}`, type: ChannelType.PrivateThread, invitable: false
+        });
+        await thread.setRateLimitPerUser(5);
+        await thread.members.add(userId);
+        const sessionResult = await createSession(userId, thread.id, null, 'renewal', identityId);
+        if (!sessionResult.success) { await thread.delete().catch(() => null); return; }
+        const loadingMsg = await thread.send('⏳ | **جاري إعداد جلسة التجديد...**');
+        setTimeout(() => sendQuestionWithRetry(userId, thread, loadingMsg), 2000);
+    } catch (error) { logError(error, 'handleRenewalIdentitySelection'); }
+}
+
+async function handleButtonInteraction(interaction) {
+    try {
+        if (interaction.customId.startsWith('choose_identity_'))         return handleIdentitySelection(interaction);
+        if (interaction.customId.startsWith('choose_renewal_identity_')) return handleRenewalIdentitySelection(interaction);
+
+        const { isUserBanned, getUserIdentities, getExpiredIdentities, addUserIdentity, generateRandomIdNumber } = getDB();
+        const { checkActiveSession, cleanupSession, createSession, getSession, updateSession, sendQuestionWithRetry, askQuestion } = getSessions();
+
+        if (interaction.customId === 'start_verification') {
+            const activeCheck = await checkActiveSession(interaction.user.id);
+            if (activeCheck.active) return interaction.reply({ content: `⏳ | **لديك جلسة نشطة!** <#${activeCheck.threadId}>`, flags: 64 });
+            if (await isUserBanned(interaction.user.id)) return interaction.reply({ content: '❌️ | **لا يمكنني العثور على هذا العضو.**', flags: 64 });
+            const currentIds = await getUserIdentities(interaction.user.id, true);
+            if (currentIds.length >= 3) return interaction.reply({ content: '❌ | **وصلت للحد الأقصى (3 هويات)**', flags: 64 });
+            await cleanupSession(interaction.user.id);
+            const thread = await interaction.channel.threads.create({
+                name: `هوية-${interaction.user.username}`, type: ChannelType.PrivateThread, invitable: false
+            });
+            await thread.setRateLimitPerUser(5);
+            await thread.members.add(interaction.user.id);
+            const idNumber      = await generateRandomIdNumber();
+            const sessionResult = await createSession(interaction.user.id, thread.id, idNumber, 'new');
+            if (!sessionResult.success) {
+                await thread.delete().catch(() => null);
+                return interaction.reply({ content: `❌ | **${sessionResult.message}**`, flags: 64 });
             }
+            await interaction.reply({ content: `✅ | **تم فتح الثريد: ${thread}**`, flags: 64 });
+            const loadingMsg = await thread.send('⏳ | **جاري إعداد الجلسة...**');
+            setTimeout(() => sendQuestionWithRetry(interaction.user.id, thread, loadingMsg), 2000);
+            return;
         }
-    } catch (error) { logError(error, 'checkAndRepostEmbed'); }
-}
 
-async function onReady() {
-    try {
-        console.log(`✅ | ${client.user.tag} متصل!`);
-        client.user.setActivity('!هوية', { type: ActivityType.Watching });
-
-        await new Promise(r => setTimeout(r, 2000));
-        cleanupTempFolder();
-        await checkAndRepostEmbed();
-
-        // مزامنة الرتب لجميع السيرفرات
-        for (const guild of client.guilds.cache.values()) {
-            console.log(`[SYNC] بدء مزامنة الرتب في ${guild.name}...`);
-            let lastId, fetched;
-            do {
-                fetched = await guild.members.fetch({ limit: 100, after: lastId });
-                for (const [, member] of fetched) {
-                    if (member.user.bot) continue;
-                    try {
-                        const identities       = await getUserIdentities(member.id, true);
-                        const activeIdentities = identities.filter(id => new Date(id.expiryDate) > new Date());
-                        await updateUserRoles(member, activeIdentities.length);
-                        await updateJobRoles(member, identities);
-                    } catch {}
-                    await new Promise(r => setTimeout(r, 50));
+        if (interaction.customId === 'start_renewal') {
+            const activeCheck = await checkActiveSession(interaction.user.id);
+            if (activeCheck.active) return interaction.reply({ content: `⏳ | **لديك جلسة نشطة!** <#${activeCheck.threadId}>`, flags: 64 });
+            if (await isUserBanned(interaction.user.id)) return interaction.reply({ content: '❌️ | **لا يمكنني العثور على هذا العضو.**', flags: 64 });
+            const expiredIds = await getExpiredIdentities(interaction.user.id);
+            if (expiredIds.length === 0) return interaction.reply({ content: '❌ | **لا توجد هويات منتهية لديك.**', flags: 64 });
+            if (expiredIds.length === 1) {
+                await cleanupSession(interaction.user.id);
+                const thread = await interaction.channel.threads.create({
+                    name: `تجديد-${interaction.user.username}`, type: ChannelType.PrivateThread, invitable: false
+                });
+                await thread.setRateLimitPerUser(5);
+                await thread.members.add(interaction.user.id);
+                const sessionResult = await createSession(interaction.user.id, thread.id, null, 'renewal', expiredIds[0].id);
+                if (!sessionResult.success) {
+                    await thread.delete().catch(() => null);
+                    return interaction.reply({ content: `❌ | **${sessionResult.message}**`, flags: 64 });
                 }
-                if (fetched.size > 0) lastId = fetched.last().id;
-                await new Promise(r => setTimeout(r, 500));
-            } while (fetched.size === 100);
-            console.log(`[SYNC] تمت مزامنة الرتب في ${guild.name}`);
+                await interaction.reply({ content: `✅ | **تم فتح الثريد: ${thread}**`, flags: 64 });
+                const loadingMsg = await thread.send('⏳ | **جاري إعداد جلسة التجديد...**');
+                setTimeout(() => sendQuestionWithRetry(interaction.user.id, thread, loadingMsg), 2000);
+            } else {
+                const row = new ActionRowBuilder().addComponents(
+                    expiredIds.map(id => new ButtonBuilder()
+                        .setCustomId(`choose_renewal_identity_${interaction.user.id}_${id.id}`)
+                        .setLabel(id.name).setStyle(ButtonStyle.Primary))
+                );
+                await interaction.reply({ content: '**اختر الهوية المنتهية للتجديد:**', components: [row], flags: 64 });
+            }
+            return;
         }
 
-        setInterval(checkAndRepostEmbed, 6 * 60 * 60 * 1000);
+        if (interaction.customId === 'confirm_account_yes') {
+            const session = await getSession(interaction.user.id);
+            if (!session) return;
+            await interaction.message.delete().catch(() => null);
+            const code = generateVerificationCode();
+            await updateSession(interaction.user.id, { sess_verificationCode: code });
+            await interaction.channel.send(
+                `🔐 | **كود التحقق الخاص بك:**\n\`\`\`${code}\`\`\`\n` +
+                `**الخطوات:**\n` +
+                `1️⃣ افتح حسابك في روبلوكس\n` +
+                `2️⃣ اذهب إلى **Edit Profile → About**\n` +
+                `3️⃣ ضع الكود في وصف حسابك واحفظ\n` +
+                `4️⃣ ارجع هنا واضغط **تحقق الآن**`
+            );
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('verify_now').setLabel('✅ تحقق الآن').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId('cancel_verification').setLabel('🛑 إلغاء').setStyle(ButtonStyle.Danger)
+            );
+            await interaction.channel.send({ components: [row] });
+            return;
+        }
 
-        cron.schedule('* * * * *', async () => {
-            try { await cleanupExpiredThreads(); } catch (e) { logError(e, 'Thread Cleanup Cron'); }
-        });
+        if (interaction.customId === 'confirm_account_no') {
+            const session = await getSession(interaction.user.id);
+            if (!session) return;
+            await interaction.message.delete().catch(() => null);
+            await interaction.channel.send('❌ | **تم رفض الحساب. جاري إغلاق الجلسة...**');
+            setTimeout(() => cleanupSession(interaction.user.id), 2000);
+            return;
+        }
 
-        cron.schedule('*/5 * * * *', async () => {
-            try {
-                const sessions = await VerificationSession.find({});
-                for (const session of sessions) await sendReminder(session.sess_discordId);
-            } catch (e) { logError(e, 'Reminder Cron'); }
-        });
-
-        cron.schedule('0 */6 * * *', async () => {
-            try { await cleanupExpiredJobRoles(); } catch (e) { logError(e, 'Job Roles Cleanup Cron'); }
-        });
-
-        cron.schedule('0 * * * *', async () => {
-            try { await cleanupAbandonedThreads(); } catch {}
-            try { cleanupTempFolder(); } catch {}
-        });
-
-        cron.schedule('0 0 * * *', async () => {
-            try {
-                const oneMonthAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
-                for (const [imagePath, lastAccess] of Object.entries(cacheTracker)) {
-                    if (lastAccess < oneMonthAgo) {
-                        const fullPath = path.join(cacheDir, imagePath);
-                        if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
-                        delete cacheTracker[imagePath];
+        if (interaction.customId === 'verify_now') {
+            const session = await getSession(interaction.user.id);
+            if (!session) return;
+            await interaction.reply({ content: '🔄 | **جاري التحقق من وصف حسابك...**' });
+            const freshDesc = await robloxAPI.getUserDescription(session.sess_data.sess_robloxUserId);
+            const codeFound = (freshDesc || '')
+                .replace(/\s/g, '').toLowerCase()
+                .includes(session.sess_verificationCode.replace(/\s/g, '').toLowerCase());
+            if (codeFound) {
+                const result = await addUserIdentity(interaction.user.id, {
+                    name:           session.sess_data.sess_name,
+                    age:            session.sess_data.sess_age,
+                    gender:         session.sess_data.sess_gender,
+                    job:            session.sess_data.sess_job,
+                    position:       'لا يوجد',
+                    robloxUsername: session.sess_data.sess_robloxUsername,
+                    robloxUserId:   session.sess_data.sess_robloxUserId,
+                    idNumber:       session.sess_data.sess_idNumber,
+                    isVerified:     true
+                });
+                if (result.success && result.user) {
+                    await interaction.editReply('✅ | **تم التحقق بنجاح! جاري تحديث الرتب...**');
+                    await new Promise(r => setTimeout(r, 500));
+                    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+                    if (member) {
+                        await updateUserRoles(member, result.user.identities.length);
+                        await updateJobRoles(member, result.user.identities);
+                        await interaction.editReply('✅ | **تم التحقق بنجاح وإنشاء الهوية وتحديث الرتب!**');
+                    } else {
+                        await interaction.editReply('✅ | **تم التحقق وإنشاء الهوية!**');
                     }
+                } else {
+                    await interaction.editReply(result.message || '❌ | **حدث خطأ في إنشاء الهوية.**');
                 }
-                saveCacheTracker();
-            } catch (e) { logError(e, 'Monthly Cache Cleanup'); }
-        });
+                await cleanupSession(interaction.user.id);
+            } else {
+                await interaction.editReply('❌ | **الكود غير موجود في وصف حسابك. تأكد من حفظ الوصف ثم حاول مرة أخرى.**');
+            }
+            return;
+        }
 
-        // تنظيف الهويات المنتهية منذ 14 يوم (يومياً)
-        cron.schedule('0 3 * * *', async () => {
-            try { await cleanupExpiredIdentities(); } catch (e) { logError(e, 'DB Cleanup Cron'); }
-        });
-
-        console.log('[CRON] تم تفعيل الجدولة الزمنية');
-    } catch (error) { logError(error, 'Ready Event'); }
+        if (interaction.customId === 'cancel_verification') {
+            const session = await getSession(interaction.user.id);
+            if (!session) return;
+            await interaction.message.delete().catch(() => null);
+            await interaction.channel.send('❌ | **تم إلغاء الجلسة.**');
+            await cleanupSession(interaction.user.id);
+        }
+    } catch (error) { logError(error, 'handleButtonInteraction'); }
 }
 
-module.exports = { onReady };
+module.exports = { handleButtonInteraction, showIdentity };
