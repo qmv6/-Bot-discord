@@ -1,26 +1,57 @@
-const mongoose = require('mongoose');
+const client = require('../client');
+const User   = require('../models/User');
+const GuildConfig = require('../models/GuildConfig');
+const { logError, logAction } = require('../utils/logger');
+const { getRole }             = require('../utils/roleManager');
 
-const verificationSessionSchema = new mongoose.Schema({
-    sess_discordId: { type: String, required: true, index: true },
-    sess_step:      { type: Number, default: 1 },
-    sess_type:      { type: String, default: 'new' },
-    sess_data: {
-        sess_discordId:       String,
-        sess_idNumber:        String,
-        sess_name:            String,
-        sess_age:             Number,
-        sess_gender:          String,
-        sess_job:             String,
-        sess_robloxUsername:  String,
-        sess_robloxUserId:    String,
-        sess_identityId:      String
-    },
-    sess_threadId:              String,
-    sess_verificationCode:      String,
-    sess_attemptsLeft:          { type: Number, default: 1 },
-    sess_alreadyEnteredUsername:{ type: Boolean, default: false },
-    sess_lastActivity:          { type: Date, default: Date.now },
-    sess_createdAt:             { type: Date, default: Date.now, expires: 1800 } // 30 دقيقة
-});
+async function cleanupExpiredJobRoles() {
+    try {
+        console.log(`[AUTO-CLEANUP] بدء تنظيف الرتب المنتهية: ${new Date().toLocaleString()}`);
+        const now   = new Date();
+        let cleaned = 0;
 
-module.exports = mongoose.model('VerificationSession', verificationSessionSchema);
+        // التكرار على جميع السيرفرات التي البوت موجود فيها
+        for (const guild of client.guilds.cache.values()) {
+            const guildConfig = await GuildConfig.findOne({ guildId: guild.id });
+            // تخطي السيرفر إذا لم يكن لديه إعدادات أو لم يحدد رتب الوظائف
+            if (!guildConfig || !guildConfig.jobRoles) continue;
+
+            const cursor = User.find({}).cursor();
+            for await (const user of cursor) {
+                try {
+                    const member = await guild.members.fetch(user.discordId).catch(() => null);
+                    if (!member) continue;
+
+                    // جلب الوظائف النشطة فقط لهذا المستخدم
+                    const activeJobs = user.identities
+                        .filter(id => new Date(id.expiryDate) > now)
+                        .map(id => id.job);
+
+                    // التكرار على رتب الوظائف المحددة لهذا السيرفر تحديداً
+                    for (const [jobName, roleId] of guildConfig.jobRoles) {
+                        if (!roleId) continue; // تخطي الوظيفة إذا لم يتم تعيين رتبة لها في هذا السيرفر
+                        
+                        // إذا كانت الوظيفة غير موجودة في قائمة الوظائف النشطة للمستخدم
+                        if (!activeJobs.includes(jobName)) {
+                            const role = await getRole(guild, roleId);
+                            // سحب الرتبة فقط إذا كانت موجودة وقابلة للإدارة ويملكها العضو
+                            if (role && role.manageable && member.roles.cache.has(role.id)) {
+                                await member.roles.remove(role);
+                                cleaned++;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // تجاهل الأخطاء الفردية لضمان استمرار المهمة
+                }
+            }
+        }
+
+        console.log(`[AUTO-CLEANUP] تم تنظيف ${cleaned} رتبة`);
+        await logAction('تنظيف تلقائي للرتب', 'system', `تم تنظيف ${cleaned} رتبة`);
+    } catch (error) {
+        logError(error, 'cleanupExpiredJobRoles');
+    }
+}
+
+module.exports = { cleanupExpiredJobRoles };
