@@ -1,241 +1,308 @@
-const { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
-const client = require('../client');
-const User   = require('../models/User');
-const { logError }                         = require('../utils/logger');
-const { updateUserRoles, updateJobRoles }  = require('../utils/roleManager');
-const { getCachedImage }                   = require('../utils/cacheManager');
-const robloxAPI                            = require('../services/robloxAPI');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const VerificationSession = require('../models/VerificationSession');
+const User                = require('../models/User');
+const client              = require('../client');
+const { activeSessions, buttonCooldowns } = require('../state');
+const { logError }        = require('../utils/logger');
+const { nameRegex, maleJobs, femaleJobs } = require('../constants');
+const { updateJobRoles }  = require('../utils/roleManager');
+const robloxAPI           = require('../services/robloxAPI');
 
-function getDB()       { return require('../db/identity'); }
-function getSessions() { return require('./sessions'); }
+function getIdentityDB() { return require('../db/identity'); }
 
-function generateVerificationCode() {
-    const chars = '0123456789ABCDEF';
-    return Array.from({ length: 8 }, () => chars[Math.floor(Math.random() * chars.length)]).join(' ');
+function convertArabicToEnglish(input) {
+    const ar = ['٠','','٢','٣','٤','','٦','٧','٨',''];
+    const fa = ['۰','','۲','۳','۴','','۶','۷','۸',''];
+    let r = input.toString();
+    ar.forEach((c, i) => r = r.replaceAll(c, String(i)));
+    fa.forEach((c, i) => r = r.replaceAll(c, String(i)));
+    return r;
 }
 
-async function showIdentity(ctx, target, identity, identityNum = null) {
+async function getSession(userId) {
+    try { return await VerificationSession.findOne({ sess_discordId: userId }); }
+    catch (error) { logError(error, 'getSession'); return null; }
+}
+
+async function checkActiveSession(userId) {
+    if (activeSessions.has(userId)) {
+        const { threadId } = activeSessions.get(userId);
+        const thread = await client.channels.fetch(threadId).catch(() => null);
+        if (thread) return { active: true, threadId };
+        activeSessions.delete(userId);
+    }
+    const dbSession = await VerificationSession.findOne({ sess_discordId: userId });
+    if (dbSession) {
+        const thread = await client.channels.fetch(dbSession.sess_threadId).catch(() => null);
+        if (thread) {
+            activeSessions.set(userId, { threadId: dbSession.sess_threadId });
+            return { active: true, threadId: dbSession.sess_threadId };
+        }
+        await VerificationSession.deleteOne({ sess_discordId: userId });
+    }
+    return { active: false };
+}
+
+async function createSession(userId, threadId, idNumber, type = 'new', identityId = null) {
     try {
-        const userObj = (typeof target === 'string')
-            ? await client.users.fetch(target).catch(() => null)
-            : target;
-        if (!userObj) { if (ctx.reply) await ctx.reply('**❌️ | لا يمكنني العثور على هذا العضو.**').catch(() => null); return; }
+        const activeCheck = await checkActiveSession(userId);
+        if (activeCheck.active) return { success: false, message: `⏳ | **لديك جلسة نشطة في:** <#${activeCheck.threadId}>` };
 
-        const userDoc = await User.findOne({ discordId: userObj.id });
-        if (!userDoc) return;
+        activeSessions.delete(userId);
+        await VerificationSession.deleteMany({ sess_discordId: userId });
 
-        let targetIdentity = identity;
-        if (targetIdentity?.id) {
-            const fresh = userDoc.identities.find(id => id.id === targetIdentity.id);
-            if (fresh) targetIdentity = fresh;
-        }
-        if (!targetIdentity) targetIdentity = userDoc.identities[0];
-        if (new Date(targetIdentity.expiryDate) < new Date()) {
-            if (ctx.reply) await ctx.reply('**❌️ | الهوية منتهية الصلاحية، يرجى تجديدها.**').catch(() => null);
-            return;
-        }
-        if (identityNum === null) identityNum = userDoc.identities.findIndex(id => id.id === targetIdentity.id) + 1;
-
-        const data = {
-            userId: userObj.id, name: targetIdentity.name, gender: targetIdentity.gender,
-            job: targetIdentity.job, age: targetIdentity.age, rank: targetIdentity.position || 'لا يوجد',
-            user: targetIdentity.robloxUsername, idNumber: targetIdentity.idNumber,
-            robloxUserId: targetIdentity.robloxUserId, robloxUsername: targetIdentity.robloxUsername,
-            expiryDate: targetIdentity.expiryDate.toISOString().split('T')[0]
+        const sessionData = {
+            sess_discordId: userId,
+            sess_step:      type === 'renewal' ? 4 : 1,
+            sess_type:      type,
+            sess_data: { sess_discordId: userId, sess_idNumber: idNumber, sess_identityId: identityId ? Number(identityId) : null },
+            sess_threadId: threadId, 
+            sess_attemptsLeft: 1, 
+            sess_alreadyEnteredUsername: false,
+            sess_lastActivity: new Date()
         };
 
-        const cachedImage = await getCachedImage(userObj.id, identityNum, data);
-        if (!cachedImage) { if (ctx.reply) await ctx.reply('❌ | **حدث خطأ في عرض الهوية.**').catch(() => null); return; }
-
-        const payload = { content: `<@${userObj.id}>`, files: [cachedImage], allowedMentions: { parse: [] } };
-        if (ctx.editReply)  await ctx.editReply(payload);
-        else if (ctx.reply) await ctx.reply(payload);
-        else                await ctx.channel.send(payload);
-    } catch (error) {
-        logError(error, 'showIdentity');
-        if (ctx.reply) await ctx.reply('❌ | **حدث خطأ في عرض الهوية.**').catch(() => null);
-    }
-}
-
-async function handleIdentitySelection(interaction) {
-    try {
-        const [,, authorId, targetId, idId] = interaction.customId.split('_');
-        if (interaction.user.id !== authorId) { await interaction.reply({ content: '❌ | **ليس لك**', flags: 64 }); return; }
-        const userDoc  = await User.findOne({ discordId: targetId });
-        const identity = userDoc?.identities.find(id => id.id == idId);
-        if (identity) {
-            await interaction.update({ components: [] });
-            const identityNum = userDoc.identities.findIndex(id => id.id == idId) + 1;
-            await showIdentity(interaction, targetId, identity, identityNum);
+        if (type === 'renewal' && identityId) {
+            const user     = await User.findOne({ discordId: userId });
+            const identity = user?.identities.find(id => id.id == Number(identityId));
+            if (identity) {
+                sessionData.sess_data.sess_gender         = identity.gender;
+                sessionData.sess_data.sess_robloxUsername = identity.robloxUsername;
+                sessionData.sess_data.sess_robloxUserId   = identity.robloxUserId;
+            }
         }
-    } catch (error) { logError(error, 'handleIdentitySelection'); }
+
+        const saved = await new VerificationSession(sessionData).save();
+        activeSessions.set(userId, { threadId, type });
+        return { success: true, session: saved };
+    } catch (error) { logError(error, 'createSession'); return { success: false, message: '❌ | **حدث خطأ في إنشاء الجلسة**' }; }
 }
 
-async function handleRenewalIdentitySelection(interaction) {
+async function updateSession(userId, updates) {
     try {
-        const parts      = interaction.customId.split('_');
-        const userId     = parts[3];
-        const identityId = parts[4];
-        if (interaction.user.id !== userId) { await interaction.reply({ content: '❌ | **ليس لك**', flags: 64 }); return; }
-        await interaction.update({ components: [] });
-        const { cleanupSession, createSession, sendQuestionWithRetry } = getSessions();
-        await cleanupSession(userId);
-        const thread = await interaction.channel.threads.create({
-            name: `تجديد-${interaction.user.username}`, type: ChannelType.PrivateThread, invitable: false
+        updates.sess_lastActivity = new Date();
+        return await VerificationSession.findOneAndUpdate(
+            { sess_discordId: userId }, { $set: updates }, { new: true }
+        );
+    } catch (error) { logError(error, 'updateSession'); return null; }
+}
+
+async function deleteSession(userId) {
+    try {
+        await VerificationSession.deleteOne({ sess_discordId: userId });
+        activeSessions.delete(userId);
+        buttonCooldowns.delete(userId);
+        return true;
+    } catch (error) { logError(error, 'deleteSession'); return false; }
+}
+
+async function cleanupSession(userId) {
+    try {
+        const session = await getSession(userId);
+        if (!session) return;
+        
+        const thread = await client.channels.fetch(session.sess_threadId).catch(() => null);
+        if (thread) await thread.delete().catch(() => null);
+        
+        await deleteSession(userId);
+    } catch (error) { logError(error, 'cleanupSession'); }
+}
+
+async function cleanupExpiredThreads() {
+    try {
+        const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+        const expired = await VerificationSession.find({
+            $or: [
+                { sess_createdAt: { $lt: thirtyMinutesAgo } },
+                { sess_lastActivity: { $lt: thirtyMinutesAgo } }
+            ]
         });
-        await thread.setRateLimitPerUser(5);
-        await thread.members.add(userId);
-        const sessionResult = await createSession(userId, thread.id, null, 'renewal', identityId);
-        if (!sessionResult.success) { await thread.delete().catch(() => null); return; }
-        const loadingMsg = await thread.send('⏳ | **جاري إعداد جلسة التجديد...**');
-        setTimeout(() => sendQuestionWithRetry(userId, thread, loadingMsg), 2000);
-    } catch (error) { logError(error, 'handleRenewalIdentitySelection'); }
+
+        for (const session of expired) {
+            const thread = await client.channels.fetch(session.sess_threadId).catch(() => null);
+            if (thread) await thread.delete().catch(() => null);
+            await VerificationSession.deleteOne({ _id: session._id });
+            activeSessions.delete(session.sess_discordId);
+        }
+    } catch (error) { logError(error, 'cleanupExpiredThreads'); }
 }
 
-async function handleButtonInteraction(interaction) {
+async function sendReminder(userId) {
     try {
-        if (interaction.customId.startsWith('choose_identity_'))         return handleIdentitySelection(interaction);
-        if (interaction.customId.startsWith('choose_renewal_identity_')) return handleRenewalIdentitySelection(interaction);
+        const session = await getSession(userId);
+        if (!session) return;
+        
+        const thread  = await client.channels.fetch(session.sess_threadId).catch(() => null);
+        if (!thread)  return;
 
-        const { isUserBanned, getUserIdentities, getExpiredIdentities, addUserIdentity, generateRandomIdNumber } = getDB();
-        const { checkActiveSession, cleanupSession, createSession, getSession, updateSession, sendQuestionWithRetry, askQuestion } = getSessions();
-
-        if (interaction.customId === 'start_verification') {
-            const activeCheck = await checkActiveSession(interaction.user.id);
-            if (activeCheck.active) return interaction.reply({ content: `⏳ | **لديك جلسة نشطة!** <#${activeCheck.threadId}>`, flags: 64 });
-            if (await isUserBanned(interaction.user.id)) return interaction.reply({ content: '❌️ | **لا يمكنني العثور على هذا العضو.**', flags: 64 });
-            const currentIds = await getUserIdentities(interaction.user.id, true);
-            if (currentIds.length >= 3) return interaction.reply({ content: '❌ | **وصلت للحد الأقصى (3 هويات)**', flags: 64 });
-            await cleanupSession(interaction.user.id);
-            const thread = await interaction.channel.threads.create({
-                name: `هوية-${interaction.user.username}`, type: ChannelType.PrivateThread, invitable: false
-            });
-            await thread.setRateLimitPerUser(5);
-            await thread.members.add(interaction.user.id);
-            const idNumber      = await generateRandomIdNumber();
-            const sessionResult = await createSession(interaction.user.id, thread.id, idNumber, 'new');
-            if (!sessionResult.success) {
-                await thread.delete().catch(() => null);
-                return interaction.reply({ content: `❌ | **${sessionResult.message}**`, flags: 64 });
-            }
-            await interaction.reply({ content: `✅ | **تم فتح الثريد: ${thread}**`, flags: 64 });
-            const loadingMsg = await thread.send('⏳ | **جاري إعداد الجلسة...**');
-            setTimeout(() => sendQuestionWithRetry(interaction.user.id, thread, loadingMsg), 2000);
-            return;
+        const minutesPassed = Math.floor((Date.now() - new Date(session.sess_lastActivity || session.sess_createdAt).getTime()) / 60000);
+        
+        if (minutesPassed > 0 && minutesPassed < 30 && minutesPassed % 10 === 0) {
+            await thread.send(`⏰ | **تذكير: مضى ${minutesPassed} دقيقة. الوقت المتبقي: ${30 - minutesPassed} دقيقة.** <@${userId}>`).catch(() => null);
         }
+        
+        if (minutesPassed === 25) {
+            await thread.send(`⚠️ | **تحذير: بقي 5 دقائق فقط قبل إغلاق الجلسة!** <@${userId}>`).catch(() => null);
+        }
+    } catch (error) { logError(error, 'sendReminder'); }
+}
 
-        if (interaction.customId === 'start_renewal') {
-            const activeCheck = await checkActiveSession(interaction.user.id);
-            if (activeCheck.active) return interaction.reply({ content: `⏳ | **لديك جلسة نشطة!** <#${activeCheck.threadId}>`, flags: 64 });
-            if (await isUserBanned(interaction.user.id)) return interaction.reply({ content: '❌️ | **لا يمكنني العثور على هذا العضو.**', flags: 64 });
-            const expiredIds = await getExpiredIdentities(interaction.user.id);
-            if (expiredIds.length === 0) return interaction.reply({ content: '❌ | **لا توجد هويات منتهية لديك.**', flags: 64 });
-            if (expiredIds.length === 1) {
-                await cleanupSession(interaction.user.id);
-                const thread = await interaction.channel.threads.create({
-                    name: `تجديد-${interaction.user.username}`, type: ChannelType.PrivateThread, invitable: false
-                });
-                await thread.setRateLimitPerUser(5);
-                await thread.members.add(interaction.user.id);
-                const sessionResult = await createSession(interaction.user.id, thread.id, null, 'renewal', expiredIds[0].id);
-                if (!sessionResult.success) {
+async function cleanupAbandonedThreads() {
+    try {
+        for (const guild of client.guilds.cache.values()) {
+            const threads = await guild.channels.fetchActiveThreads().catch(() => null);
+            if (!threads) continue;
+
+            for (const [, thread] of threads.threads) {
+                if (!thread.name.startsWith('هوية-') && !thread.name.startsWith('تجديد-')) continue;
+                
+                const members = await thread.members.fetch().catch(() => null);
+                if (!members || !members.some(m => !m.user?.bot)) {
+                    const username = thread.name.replace('هوية-', '').replace('تجديد-', '');
+                    const user     = guild.members.cache.find(m => m.user.username === username);
+                    if (user) await deleteSession(user.id);
                     await thread.delete().catch(() => null);
-                    return interaction.reply({ content: `❌ | **${sessionResult.message}**`, flags: 64 });
                 }
-                await interaction.reply({ content: `✅ | **تم فتح الثريد: ${thread}**`, flags: 64 });
-                const loadingMsg = await thread.send('⏳ | **جاري إعداد جلسة التجديد...**');
-                setTimeout(() => sendQuestionWithRetry(interaction.user.id, thread, loadingMsg), 2000);
-            } else {
-                const row = new ActionRowBuilder().addComponents(
-                    expiredIds.map(id => new ButtonBuilder()
-                        .setCustomId(`choose_renewal_identity_${interaction.user.id}_${id.id}`)
-                        .setLabel(id.name).setStyle(ButtonStyle.Primary))
-                );
-                await interaction.reply({ content: '**اختر الهوية المنتهية للتجديد:**', components: [row], flags: 64 });
             }
-            return;
         }
+    } catch (error) { logError(error, 'cleanupAbandonedThreads'); }
+}
 
-        if (interaction.customId === 'confirm_account_yes') {
-            const session = await getSession(interaction.user.id);
-            if (!session) return;
-            await interaction.message.delete().catch(() => null);
-            const code = generateVerificationCode();
-            await updateSession(interaction.user.id, { sess_verificationCode: code });
-            await interaction.channel.send(
-                `🔐 | **كود التحقق الخاص بك:**\n\`\`\`${code}\`\`\`\n` +
-                `**الخطوات:**\n` +
-                `1️⃣ افتح حسابك في روبلوكس\n` +
-                `2️⃣ اذهب إلى **Edit Profile → About**\n` +
-                `3️⃣ ضع الكود في وصف حسابك واحفظ\n` +
-                `4️⃣ ارجع هنا واضغط **تحقق الآن**`
-            );
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('verify_now').setLabel('✅ تحقق الآن').setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId('cancel_verification').setLabel('🛑 إلغاء').setStyle(ButtonStyle.Danger)
-            );
-            await interaction.channel.send({ components: [row] });
-            return;
+async function askQuestion(userId, thread) {
+    try {
+        const session = await getSession(userId);
+        if (!session) return;
+        
+        const channel = await client.channels.fetch(session.sess_threadId).catch(() => null);
+        if (!channel) { await deleteSession(userId); return; }
+
+        await new Promise(r => setTimeout(r, 100));
+
+        let msg = '';
+        if (session.sess_type === 'renewal') {
+            const jobs = session.sess_data.sess_gender === 'ذكر' ? maleJobs : femaleJobs;
+            const map  = {
+                4: '**__1/3__ - ما هو أسمك؟**',
+                5: '**__2/3__ - كم عمرك الجديد؟**',
+                6: `**__3/3__ - ما هي وظيفتك الجديدة؟**\n(${jobs.join(' - ')})`
+            };
+            msg = map[session.sess_step] || '**جاري الانتقال...**';
+        } else {
+            const jobs = session.sess_data.sess_gender === 'ذكر' ? maleJobs : femaleJobs;
+            const map  = {
+                1: '**__1/5__ - ما هو أسمك؟**',
+                2: '**__2/5__ - كم عمرك؟**',
+                3: '**__3/5__ - ما هو جنسك؟**\n(ذكر / انثى)',
+                4: `**__4/5__ - ما هي وظيفتك؟**\n(${jobs.join(' - ')})`,
+                5: '**__5/5__ - ما هو يوزرك في روبلوكس؟**\nمثال: RobloxUser123'
+            };
+            msg = map[session.sess_step] || '**الرجاء الإجابة:**';
         }
+        
+        await channel.send(msg).catch(() => null);
+    } catch (error) { logError(error, 'askQuestion'); }
+}
 
-        if (interaction.customId === 'confirm_account_no') {
-            const session = await getSession(interaction.user.id);
-            if (!session) return;
-            await interaction.message.delete().catch(() => null);
-            await interaction.channel.send('❌ | **تم رفض الحساب. جاري إغلاق الجلسة...**');
-            setTimeout(() => cleanupSession(interaction.user.id), 2000);
-            return;
-        }
+async function sendQuestionWithRetry(userId, thread, loadingMsg, retryCount = 0) {
+    if (retryCount >= 3) { await loadingMsg.edit('❌ | فشل إعداد الجلسة، يرجى المحاولة مرة أخرى.').catch(() => null); return; }
+    
+    const session = await getSession(userId);
+    if (!session) {
+        await new Promise(r => setTimeout(r, 1000));
+        return sendQuestionWithRetry(userId, thread, loadingMsg, retryCount + 1);
+    }
+    
+    await loadingMsg.delete().catch(() => null);
+    await askQuestion(userId, thread);
+}
 
-        if (interaction.customId === 'verify_now') {
-            const session = await getSession(interaction.user.id);
-            if (!session) return;
-            await interaction.reply({ content: '🔄 | **جاري التحقق من وصف حسابك...**' });
-            const freshDesc = await robloxAPI.getUserDescription(session.sess_data.sess_robloxUserId);
-            const codeFound = (freshDesc || '')
-                .replace(/\s/g, '').toLowerCase()
-                .includes(session.sess_verificationCode.replace(/\s/g, '').toLowerCase());
-            if (codeFound) {
-                const result = await addUserIdentity(interaction.user.id, {
-                    name:           session.sess_data.sess_name,
-                    age:            session.sess_data.sess_age,
-                    gender:         session.sess_data.sess_gender,
-                    job:            session.sess_data.sess_job,
-                    position:       'لا يوجد',
-                    robloxUsername: session.sess_data.sess_robloxUsername,
-                    robloxUserId:   session.sess_data.sess_robloxUserId,
-                    idNumber:       session.sess_data.sess_idNumber,
-                    isVerified:     true
+async function handleSessionStep(session, message, input) {
+    try {
+        const userId = message.author.id;
+        await updateSession(userId, { sess_lastActivity: new Date() });
+
+        if (session.sess_step >= (session.sess_type === 'renewal' ? 7 : 6)) return { success: true };
+
+        if (session.sess_type === 'renewal') {
+            if (session.sess_step === 4) {
+                if (!nameRegex.test(input)) { await message.reply('❌ | **الاسم 2-12 حرف (عربي/إنجليزي).** حاول مرة أخرى:'); return { success: false, stayInStep: true }; }
+                await updateSession(userId, { 'sess_data.sess_name': input, sess_step: 5 });
+                return { success: true };
+            }
+            if (session.sess_step === 5) {
+                const age = parseInt(convertArabicToEnglish(input));
+                if (isNaN(age) || age < 1 || age > 99) { await message.reply('❌ | **رقم بين 1 و99.** حاول مرة أخرى:'); return { success: false, stayInStep: true }; }
+                await updateSession(userId, { 'sess_data.sess_age': age, sess_step: 6 });
+                return { success: true };
+            }
+            if (session.sess_step === 6) {
+                const jobs = session.sess_data.sess_gender === 'ذكر' ? maleJobs : femaleJobs;
+                if (!jobs.includes(input)) { await message.reply(`❌ | **اختر: (${jobs.join(' - ')})**`); return { success: false, stayInStep: true }; }
+                await updateSession(userId, { 'sess_data.sess_job': input, sess_step: 7 });
+                const result = await getIdentityDB().renewUserIdentity(userId, session.sess_data.sess_identityId, {
+                    name: session.sess_data.sess_name, age: session.sess_data.sess_age, job: input
                 });
                 if (result.success && result.user) {
-                    await interaction.editReply('✅ | **تم التحقق بنجاح! جاري تحديث الرتب...**');
-                    await new Promise(r => setTimeout(r, 500));
-                    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-                    if (member) {
-                        await updateUserRoles(member, result.user.identities.length);
-                        await updateJobRoles(member, result.user.identities);
-                        await interaction.editReply('✅ | **تم التحقق بنجاح وإنشاء الهوية وتحديث الرتب!**');
-                    } else {
-                        await interaction.editReply('✅ | **تم التحقق وإنشاء الهوية!**');
-                    }
-                } else {
-                    await interaction.editReply(result.message || '❌ | **حدث خطأ في إنشاء الهوية.**');
+                    const member = await message.guild.members.fetch(userId).catch(() => null);
+                    if (member) await updateJobRoles(member, result.user.identities);
                 }
-                await cleanupSession(interaction.user.id);
-            } else {
-                await interaction.editReply('❌ | **الكود غير موجود في وصف حسابك. تأكد من حفظ الوصف ثم حاول مرة أخرى.**');
+                await message.channel.send('✅ | **تم تجديد الهوية بنجاح!**');
+                await cleanupSession(userId);
+                return { success: true };
             }
-            return;
+        } else {
+            if (session.sess_step === 1) {
+                if (!nameRegex.test(input)) { await message.reply('❌ | **الاسم 2-12 حرف (عربي/إنجليزي).** حاول مرة أخرى:'); return { success: false, stayInStep: true }; }
+                const currentIds = await getIdentityDB().getUserIdentities(userId, true);
+                if (currentIds.some(id => id.name === input)) { await message.reply(' | **هذا الاسم مستخدم مسبقاً.**'); return { success: false, stayInStep: true }; }
+                await updateSession(userId, { 'sess_data.sess_name': input, sess_step: 2 });
+                return { success: true };
+            }
+            if (session.sess_step === 2) {
+                const age = parseInt(convertArabicToEnglish(input));
+                if (isNaN(age) || age < 1 || age > 99) { await message.reply(' | **رقم بين 1 و99.**'); return { success: false, stayInStep: true }; }
+                await updateSession(userId, { 'sess_data.sess_age': age, sess_step: 3 });
+                return { success: true };
+            }
+            if (session.sess_step === 3) {
+                if (!['ذكر', 'انثى'].includes(input)) { await message.reply('❌ | **(ذكر / انثى) فقط.**'); return { success: false, stayInStep: true }; }
+                await updateSession(userId, { 'sess_data.sess_gender': input, sess_step: 4 });
+                return { success: true };
+            }
+            if (session.sess_step === 4) {
+                const jobs = session.sess_data.sess_gender === 'ذكر' ? maleJobs : femaleJobs;
+                if (!jobs.includes(input)) { await message.reply(`❌ | **(${jobs.join(' - ')})**`); return { success: false, stayInStep: true }; }
+                await updateSession(userId, { 'sess_data.sess_job': input, sess_step: 5 });
+                return { success: true };
+            }
+            if (session.sess_step === 5) {
+                try {
+                    await message.channel.sendTyping();
+                    const res = await robloxAPI.verifyRobloxAccount(input);
+                    if (!res.success) { await message.reply(`❌ | **${res.message}**\n\n**أدخل يوزر روبلوكس صحيح:**`); return { success: false, stayInStep: true }; }
+                    await updateSession(userId, {
+                        'sess_data.sess_robloxUsername': res.user.name,
+                        'sess_data.sess_robloxUserId':   res.user.id,
+                        sess_step: 6
+                    });
+                    const creationDate = new Date(res.user.created).toLocaleDateString('ar-SA');
+                    const displayText  = `# هل هذا حسابك؟\n\n**الأسم** ${res.user.displayName}\n**العمر:** @${res.user.name}\n**تاريخ الإنشاء:** ${creationDate}\n**وصف الحساب:** ${res.user.description || 'لا يوجد وصف'}`;
+                    const row = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId('confirm_account_yes').setLabel('✅ نعم').setStyle(ButtonStyle.Success),
+                        new ButtonBuilder().setCustomId('confirm_account_no').setLabel('❌ لا').setStyle(ButtonStyle.Danger)
+                    );
+                    await message.reply({ content: displayText, components: [row] });
+                    return { success: true };
+                } catch (error) { logError(error, 'Roblox Verification'); await message.reply('❌ | **خطأ في التحقق. حاول مرة أخرى:**'); return { success: false, stayInStep: true }; }
+            }
         }
-
-        if (interaction.customId === 'cancel_verification') {
-            const session = await getSession(interaction.user.id);
-            if (!session) return;
-            await interaction.message.delete().catch(() => null);
-            await interaction.channel.send('❌ | **تم إلغاء الجلسة.**');
-            await cleanupSession(interaction.user.id);
-        }
-    } catch (error) { logError(error, 'handleButtonInteraction'); }
+        return { success: true };
+    } catch (error) { logError(error, 'handleSessionStep'); return { success: false, stayInStep: true }; }
 }
 
-module.exports = { handleButtonInteraction, showIdentity };
+module.exports = {
+    getSession, checkActiveSession, createSession, updateSession,
+    deleteSession, cleanupSession, cleanupExpiredThreads,
+    sendReminder, cleanupAbandonedThreads,
+    askQuestion, sendQuestionWithRetry, handleSessionStep
+};
