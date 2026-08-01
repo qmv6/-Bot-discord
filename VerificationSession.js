@@ -1,23 +1,26 @@
-const nameRegex   = /^[a-zA-Z\u0621-\u064A\s]{2,12}$/;
-const maleJobs    = ['مسعف', 'شرطي', 'مجرم', 'مصلح'];
-const femaleJobs  = ['مسعفة', 'شرطية', 'مجرمة', 'مصلحة'];
+const mongoose = require('mongoose');
 
-const jobToRoleMap = {
-    'مسعف':   '1380650660336369705',
-    'مسعفة':  '1380650660336369705',
-    'شرطي':   '1380650132823081000',
-    'شرطية':  '1380650132823081000',
-    'مجرم':   '1380650589800628264',
-    'مجرمة':  '1380650589800628264',
-    'مصلح':   '1380650805027278999',
-    'مصلحة':  '1380650805027278999'
-};
+const verificationSessionSchema = new mongoose.Schema({
+    sess_discordId: { type: String, required: true, index: true },
+    sess_step:      { type: Number, default: 1 },
+    sess_type:      { type: String, default: 'new' },
+    sess_data: {
+        sess_discordId:       String,
+        sess_idNumber:        String,
+        sess_name:            String,
+        sess_age:             Number,
+        sess_gender:          String,
+        sess_job:             String,
+        sess_robloxUsername:  String,
+        sess_robloxUserId:    String,
+        sess_identityId:      String
+    },
+    sess_threadId:              String,
+    sess_verificationCode:      String,
+    sess_attemptsLeft:          { type: Number, default: 1 },
+    sess_alreadyEnteredUsername:{ type: Boolean, default: false },
+    sess_lastActivity:          { type: Date, default: Date.now },
+    sess_createdAt:             { type: Date, default: Date.now, expires: 1800 } // 30 دقيقة
+});
 
-const roleToJobsMap = {
-    '1380650660336369705': ['مسعف',  'مسعفة'],
-    '1380650132823081000': ['شرطي',  'شرطية'],
-    '1380650589800628264': ['مجرم',  'مجرمة'],
-    '1380650805027278999': ['مصلح',  'مصلحة']
-};
-
-module.exports = { nameRegex, maleJobs, femaleJobs, jobToRoleMap, roleToJobsMap };
+module.exports = mongoose.model('VerificationSession', verificationSessionSchema);
